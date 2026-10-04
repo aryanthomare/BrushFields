@@ -17,6 +17,10 @@ Open `index.html` in a browser, or serve the repository root:
 python -m http.server 8000   # then visit http://localhost:8000
 ```
 
+After pulling an update, reload with **Ctrl+Shift+R** (Cmd+Shift+R on a Mac)
+so the browser drops any cached copy. `index.html` loads `sketch.js?v=N` and
+`style.css?v=N`; bump `N` when you change either file.
+
 The libraries load from the jsDelivr content delivery network, so you need
 to be online: p5.js 2.2.3, p5.brush 2.2.3 and math.js 15.2.0.
 
@@ -42,6 +46,14 @@ to be online: p5.js 2.2.3, p5.brush 2.2.3 and math.js 15.2.0.
   painting shows. Particle dots are off by default; turn them on under View.
 - **Redraw clean** repaints every stored path from scratch with fresh colour
   variation.
+- **Save PNG** names the file after the field, with a millisecond timestamp
+  so every save gets its own name:
+  `dx=y__dy=a (1-x^2) y-x__a=1__2026-10-04_23-05-12-345.png`.
+  Only the parameters the equations use are listed. Names stay plain ASCII
+  (`*` becomes a space, `/` becomes ` over `) and are cut to 200 characters,
+  so the full equations, parameters, window, style and time are also stored
+  in the PNG's Title and Description text fields. Image viewers that show
+  metadata display these, or you can run `exiftool file.png`.
 - **Paint styles** (Brush → Style):
   - *Gouache* (default): an opaque body with bristles dragged through it.
   - *Oil (bristle brush)*: the stroke is built from 7–12 separate bristles.
