@@ -70,13 +70,17 @@
 
     <section class="group" aria-labelledby="g-brush">
       <h2 id="g-brush">Brush</h2>
-      <label class="field-row"><span class="lbl">Brush</span><select id="brush"></select></label>
+      <label class="field-row"><span class="lbl">Style</span><select id="style"></select></label>
+      <label class="field-row" id="brush-row"><span class="lbl">Brush</span><select id="brush"></select></label>
+      <label class="slider-row" id="dip-row"><span class="lbl">Stroke length</span><input id="dip" type="range" min="40" max="420" step="10" value="170"><output id="dip-out">170</output></label>
+      <label class="slider-row" id="jitter-row"><span class="lbl">Colour variation</span><input id="jitter" type="range" min="0" max="1" step="0.05" value="0.5"><output id="jitter-out">0.50</output></label>
+      <p id="water-note" class="note" hidden>Watercolour is the slowest style. It works best with fewer than about 40 particles.</p>
       <label class="slider-row"><span class="lbl">Weight</span><input id="weight" type="range" min="0.3" max="4" step="0.1" value="1"><output id="weight-out">1.0</output></label>
       <label class="field-row">
         <span class="lbl">Colour</span>
         <select id="colormode">
           <option value="single">One ink</option>
-          <option value="palette">Ink per particle</option>
+          <option value="palette" selected>Ink per particle</option>
           <option value="speed">Blend by speed</option>
         </select>
       </label>

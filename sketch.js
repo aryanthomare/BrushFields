@@ -13,8 +13,17 @@
 //
 //  Pipeline per frame:
 //    integrate (RK4)  →  record points in world units  →  cut them into
-//    chunks  →  queue  →  drain the queue into brush.spline() under a time
+//    strokes  →  queue  →  drain the queue into p5.brush under a time
 //    budget, so a heavy redraw never freezes the UI.
+//
+//  Paint styles (see drawPaintStroke):
+//    dry         — one brush.spline with a built-in pencil / ink brush
+//    bristle     — a flat custom tip whose dots leave bristle streaks
+//    gouache     — an opaque body (brush.wash on a ribbon polygon) with a
+//                  lighter bristle pass on top
+//    watercolour — a ribbon polygon with p5.brush's watercolour fill
+//  Paint strokes are "dips": a fixed length of path, tapered at both ends,
+//  each with a slightly different mix of the colour.
 // =============================================================================
 
 /* global p5, brush, math */
@@ -27,6 +36,13 @@ const LIVE_CHUNK = 24;          // points per live brush stroke
 const CLEAN_CHUNK = 420;        // points per stroke when redrawing cleanly
 const SPEED_CHUNK = 36;         // shorter strokes when colour follows speed
 const FRAME_BUDGET_MS = 14;     // time allowed for brush drawing per frame
+const POINT_GAP = 2.5;          // min px between recorded points (at 600 px)
+const STYLES = {
+  dry:         { label: "Pencil & ink" },
+  bristle:     { label: "Bristle paint" },
+  gouache:     { label: "Gouache" },
+  watercolour: { label: "Watercolour" },
+};
 
 // ── Presets ───────────────────────────────────────────────────────────────────
 // Each preset sets the equations, the window onto the plane, the parameters
@@ -103,11 +119,14 @@ const S = {
   boundary: "stop",             // "stop" | "wrap"
   showField: true,
   showHeads: true,
-  brushName: "HB",
+  style: "gouache",
+  brushName: "HB",              // built-in brush used by the "dry" style
+  dipLength: 170,               // px of path per paint stroke
+  jitter: 0.5,                  // 0–1 colour variation between paint strokes
   weight: 1,
   ink: PALETTE[0],
   inkFast: "#a23b2a",
-  colorMode: "single",          // "single" | "palette" | "speed"
+  colorMode: "palette",         // "single" | "palette" | "speed"
   pressureFromSpeed: true,
   curvature: 0.3,
   particles: [],
@@ -124,6 +143,7 @@ let needClear = true;
 let needRedraw = false;
 let fieldCache = null;          // quiver samples
 let fpsSmooth = 60;
+let paperTex = null;            // p5.Graphics with paper grain, drawn on clear
 
 // ── Coordinate mapping (world ↔ pixels, y up in world) ───────────────────────
 const sx = () => W / (S.domain.xmax - S.domain.xmin);
@@ -210,23 +230,36 @@ function recordPoint(p, force = false) {
   if (!force && last) {
     const [ax, ay] = toPx(last[0], last[1]);
     const [bx, by] = toPx(p.x, p.y);
-    if (Math.hypot(bx - ax, by - ay) < 2.5 * (W / BASE_SIZE)) return;  // too close to bother
+    if (Math.hypot(bx - ax, by - ay) < POINT_GAP * pxScale()) return;  // too close to bother
   }
   run.push([p.x, p.y, p.speed]);
 }
 
-// Queue the not-yet-drawn tail of the current run in strokes of LIVE_CHUNK
-// points. With final = true the leftover short tail is queued as well.
+// Points per stroke while the simulation runs. Dry media draws short pieces
+// so the trace keeps up with the particle; paint draws whole "dips".
+function strokePoints() {
+  if (S.style === "dry") return LIVE_CHUNK;
+  return Math.max(8, Math.round(S.dipLength / POINT_GAP));
+}
+
+// How far a stroke reaches back into the previous one. Paint strokes overlap
+// a little, the way a painter restarts slightly behind where paint ran out.
+function strokeOverlap() {
+  return S.style === "dry" ? 1 : Math.round(strokePoints() * 0.18);
+}
+
+// Queue the not-yet-drawn tail of the current run as strokes. With
+// final = true the leftover short tail is queued as well.
 function flushParticle(p, final = false) {
   const run = p.runs[p.runs.length - 1];
-  while (run.length - p.sent >= LIVE_CHUNK) {
-    const end = p.sent + LIVE_CHUNK;
-    // start one point back so consecutive strokes join
-    queueStroke(run.slice(Math.max(0, p.sent - 1), end), p.color);
+  const n = strokePoints(), back = strokeOverlap();
+  while (run.length - p.sent >= n) {
+    const end = p.sent + n;
+    queueStroke(run.slice(Math.max(0, p.sent - back), end), p.color);
     p.sent = end;
   }
   if (final && run.length > p.sent) {
-    queueStroke(run.slice(Math.max(0, p.sent - 1)), p.color);
+    queueStroke(run.slice(Math.max(0, p.sent - back)), p.color);
     p.sent = run.length;
   }
 }
@@ -297,6 +330,120 @@ function lerpHex(a, b, u) {
   return "#" + out.toString(16).padStart(6, "0");
 }
 
+// ── Colour helpers (hex ↔ HSL) for per-stroke paint variation ───────────────
+function hexToHsl(hex) {
+  const n = parseInt(hex.slice(1), 16);
+  const r = ((n >> 16) & 255) / 255, g = ((n >> 8) & 255) / 255, b = (n & 255) / 255;
+  const max = Math.max(r, g, b), min = Math.min(r, g, b), l = (max + min) / 2;
+  let h = 0, sat = 0;
+  if (max !== min) {
+    const d = max - min;
+    sat = l > 0.5 ? d / (2 - max - min) : d / (max + min);
+    h = max === r ? (g - b) / d + (g < b ? 6 : 0) : max === g ? (b - r) / d + 2 : (r - g) / d + 4;
+    h *= 60;
+  }
+  return [h, sat, l];
+}
+
+function hslToHex(h, sat, l) {
+  h = ((h % 360) + 360) % 360;
+  sat = Math.min(1, Math.max(0, sat));
+  l = Math.min(1, Math.max(0, l));
+  const c = (1 - Math.abs(2 * l - 1)) * sat, x = c * (1 - Math.abs(((h / 60) % 2) - 1)), m = l - c / 2;
+  const [r, g, b] = h < 60 ? [c, x, 0] : h < 120 ? [x, c, 0] : h < 180 ? [0, c, x]
+    : h < 240 ? [0, x, c] : h < 300 ? [x, 0, c] : [c, 0, x];
+  const to = (v) => Math.round((v + m) * 255).toString(16).padStart(2, "0");
+  return "#" + to(r) + to(g) + to(b);
+}
+
+// shift lightness (dl, 0–1 units) and hue (dh, degrees)
+function shade(hex, dl, dh = 0, ds = 0) {
+  const [h, sat, l] = hexToHsl(hex);
+  return hslToHex(h + dh, sat + ds, l + dl);
+}
+
+// a slightly different mix of the same paint for each dip
+function mixVariation(hex) {
+  const j = S.jitter;
+  if (!j) return hex;
+  const g = () => (Math.random() + Math.random() + Math.random() - 1.5) / 1.5;  // ~[-1, 1], centred
+  return shade(hex, 0.07 * j * g(), 9 * j * g(), 0.08 * j * g());
+}
+
+// ── Paint brushes ─────────────────────────────────────────────────────────────
+// Registered before scaleBrushes() so they scale with the built-ins.
+// A custom tip is drawn in a 100 × 100 space; dark = paint, white = none.
+// With rotate: "natural" the tip's y axis lies across the stroke, so a column
+// of dots along y becomes a flat brush whose dots leave bristle streaks.
+function bristleTip(m, seed, gapChance, underlay) {
+  let s = seed;
+  const rnd = (a, b) => {                       // small deterministic generator
+    s = (s * 16807) % 2147483647;
+    return a + (b - a) * ((s - 1) / 2147483646);
+  };
+  if (underlay) { m.fill(0, underlay); m.rect(-3, -44, 6, 88); }
+  for (let y = -46; y < 46;) {
+    const r = rnd(1.4, 3.4);
+    if (rnd(0, 1) > gapChance) {
+      m.fill(0, rnd(160, 255));
+      m.ellipse(rnd(-1.5, 1.5), y, r * 2.6, r * 1.1);
+    }
+    y += r * rnd(1.0, 1.7);
+  }
+}
+
+function addPaintBrushes() {
+  // dense flat brush: loaded with paint, faint streaks
+  brush.add("vf-flat", {
+    type: "custom", weight: 5.5, scatter: 0.05, opacity: 200, spacing: 0.14,
+    pressure: [1.05, 1, 0.9], rotate: "natural", markerTip: false, noise: 0.4,
+    tip: (m) => bristleTip(m, 6, 0.15, 60),
+  });
+  // sparse flat brush: the dry, broken texture laid over gouache
+  brush.add("vf-dry", {
+    type: "custom", weight: 9, scatter: 0.08, opacity: 200, spacing: 0.2,
+    pressure: [1, 1, 0.85], rotate: "natural", markerTip: false, noise: 0.5,
+    tip: (m) => bristleTip(m, 13, 0.45, 0),
+  });
+}
+
+// Paper grain: per-pixel tooth, soft blotches and a few fibres, baked under
+// every painting. Drawn with the raw 2D context because tens of thousands of
+// p5 shape calls would stall start-up.
+function makePaperTexture() {
+  const g = P.createGraphics(W, H);
+  g.pixelDensity(1);
+  const ctx = g.drawingContext;
+  const img = ctx.createImageData(W, H);
+  const d = img.data;
+  for (let i = 0; i < d.length; i += 4) {
+    const r = Math.random();
+    if (r < 0.5) { d[i] = 70; d[i + 1] = 62; d[i + 2] = 48; d[i + 3] = r * 30; }     // dark tooth
+    else { d[i] = 255; d[i + 1] = 255; d[i + 2] = 250; d[i + 3] = (r - 0.5) * 36; } // light tooth
+  }
+  ctx.putImageData(img, 0, 0);
+  ctx.fillStyle = "rgb(120, 110, 90)";
+  for (let i = 0; i < (W * H) / 900; i++) {          // soft blotches
+    ctx.globalAlpha = Math.random() * 0.014;
+    const r = 10 + Math.random() * 45;
+    ctx.beginPath();
+    ctx.ellipse(Math.random() * W, Math.random() * H, r, r * (0.6 + Math.random() * 0.8), Math.random() * Math.PI, 0, Math.PI * 2);
+    ctx.fill();
+  }
+  ctx.globalAlpha = 0.05;                            // a few fibres
+  ctx.strokeStyle = "rgb(110, 100, 80)";
+  ctx.lineWidth = 0.6;
+  ctx.beginPath();
+  for (let i = 0; i < (W * H) / 4000; i++) {
+    const x = Math.random() * W, y = Math.random() * H, a = Math.random() * Math.PI * 2, l = 4 + Math.random() * 10;
+    ctx.moveTo(x, y);
+    ctx.lineTo(x + Math.cos(a) * l, y + Math.sin(a) * l);
+  }
+  ctx.stroke();
+  ctx.globalAlpha = 1;
+  return g;
+}
+
 function queueStroke(worldPts, color) {
   if (worldPts.length < 2) return;
   let col = color;
@@ -304,39 +451,113 @@ function queueStroke(worldPts, color) {
     const mean = worldPts.reduce((s, q) => s + q[2], 0) / worldPts.length;
     col = speedColor(mean);
   }
-  const pts = worldPts.map(([x, y, s]) => {
+  if (S.style !== "dry") col = mixVariation(col);
+  const n = worldPts.length;
+  const pts = worldPts.map(([x, y, s], i) => {
     const [px, py] = toPx(x, y);
-    return [px, py, pressureFor(s)];
+    const taper = S.style === "dry" ? 1 : dipEnvelope(n > 1 ? i / (n - 1) : 0, n);
+    return [px, py, pressureFor(s) * taper];
   });
-  drawQueue.push({ pts, col, brushName: S.brushName, weight: S.weight });
+  drawQueue.push({ pts, col, style: S.style, brushName: S.brushName, weight: S.weight });
+}
+
+// Pressure along one dip: a quick press at the start, full body, then the
+// brush lifting and running dry over the last third.
+// The next dip starts inside this one's tail (strokeOverlap), so the
+// narrowing is mostly painted over and only shows where a path ends.
+function dipEnvelope(u, n) {
+  const short = n < 12;                                   // tails of a path: no big taper
+  const rise = short ? 0 : 0.08, fall = short ? 0.5 : 0.25;
+  let e = 1;
+  if (u < rise) e = 0.7 + 0.3 * (u / rise);
+  if (u > 1 - fall) e = Math.min(e, 1 - 0.45 * Math.pow((u - (1 - fall)) / fall, 1.5));
+  return e;
+}
+
+// Outline of a stroke as a closed polygon: offset each point along its normal
+// by a half-width that follows the pressure. Only every `step`-th point is
+// used: p5.brush's watercolour fill subdivides every edge, so fewer vertices
+// make it much cheaper.
+function ribbon(pts, halfWidth, step = 2) {
+  const left = [], right = [];
+  const last = pts.length - 1;
+  const idx = [];
+  for (let i = 0; i < last; i += step) idx.push(i);
+  idx.push(last);                                  // always end on the final point
+  for (const i of idx) {
+    const a = pts[Math.max(0, i - 1)], b = pts[Math.min(last, i + 1)];
+    let nx = -(b[1] - a[1]), ny = b[0] - a[0];
+    const len = Math.hypot(nx, ny) || 1;
+    nx /= len; ny /= len;
+    const w = halfWidth * pts[i][2] * (1 + 0.08 * Math.sin(i * 0.7));   // slight wobble at the edge
+    left.push([pts[i][0] + nx * w, pts[i][1] + ny * w]);
+    right.push([pts[i][0] - nx * w, pts[i][1] - ny * w]);
+  }
+  return left.concat(right.reverse());
+}
+
+function drawStroke(s) {
+  const k = pxScale();
+  switch (s.style) {
+    case "bristle":
+      brush.set("vf-flat", s.col, s.weight);
+      brush.spline(s.pts, S.curvature);
+      // a second, darker and broken pass: paint picked up unevenly by the bristles
+      brush.set("vf-dry", shade(s.col, -0.06), s.weight * 0.6);
+      brush.spline(s.pts, S.curvature);
+      break;
+    case "gouache": {
+      brush.noStroke();
+      brush.wash(s.col, 215);
+      brush.polygon(ribbon(s.pts, 5.2 * k * s.weight));
+      brush.noWash();
+      // lighter, broken bristle texture dragged over the wet body
+      brush.set("vf-dry", shade(s.col, 0.09, 0, -0.05), s.weight * 0.85);
+      brush.spline(s.pts, S.curvature);
+      break;
+    }
+    case "watercolour":
+      brush.noStroke();
+      brush.fill(s.col, 90);
+      brush.fillBleed(0.05);
+      brush.fillTexture(0.45, 0.55);
+      brush.polygon(ribbon(s.pts, 6 * k * s.weight, 5));
+      brush.noFill();
+      break;
+    default:
+      brush.set(s.brushName, s.col, s.weight);
+      brush.spline(s.pts, S.curvature);
+  }
 }
 
 function drainQueue() {
   const t0 = performance.now();
   while (drawQueue.length && performance.now() - t0 < FRAME_BUDGET_MS) {
     const s = drawQueue.shift();
-    // a stroke whose points all coincide makes brush.spline throw; skip it
+    // a stroke whose points all coincide makes p5.brush throw; skip it
     const [a, b] = [s.pts[0], s.pts[s.pts.length - 1]];
     if (s.pts.length === 2 && Math.hypot(a[0] - b[0], a[1] - b[1]) < 0.5) continue;
-    brush.set(s.brushName, s.col, s.weight);
     try {
-      brush.spline(s.pts, S.curvature);
+      drawStroke(s);
     } catch (err) {
       console.warn("stroke skipped:", err.message);
     }
   }
 }
 
-// Re-queue every stored path as long strokes (no seams from live chunking).
+// Re-queue every stored path. Dry media gets long seamless strokes; paint
+// styles are re-laid as dips with fresh colour variation.
 function redrawClean() {
   drawQueue = [];
   needClear = true;
-  const size = S.colorMode === "speed" ? SPEED_CHUNK : CLEAN_CHUNK;
+  const size = S.style !== "dry" ? strokePoints()
+    : S.colorMode === "speed" ? SPEED_CHUNK : CLEAN_CHUNK;
+  const back = strokeOverlap();
   for (const p of S.particles) {
     if (S.colorMode === "single") p.color = S.ink;
     for (const run of p.runs) {
       for (let i = 0; i < run.length - 1; i += size) {
-        queueStroke(run.slice(Math.max(0, i - 1), i + size + 1), p.color);
+        queueStroke(run.slice(Math.max(0, i - back), i + size + 1), p.color);
       }
     }
     p.sent = p.runs[p.runs.length - 1].length;
@@ -461,6 +682,9 @@ function fitToStage() {
   }
 }
 
+// canvas size relative to the 600 px reference
+const pxScale = () => Math.min(W, H) / BASE_SIZE;
+
 function applyBrushScale() {
   const target = 3 * (Math.min(W, H) / BASE_SIZE);
   brush.scaleBrushes(target / brushScale);
@@ -487,8 +711,10 @@ const sketch = (p) => {
     c.id("paper");
     sizeOverlay();
     fitToStage();
+    addPaintBrushes();
     applyBrushScale();
     populateBrushes();
+    paperTex = makePaperTexture();
     new ResizeObserver(fitToStage).observe(document.getElementById("stage"));
     loadPreset("vanderpol");
     seedGrid(7, 5);
@@ -496,7 +722,11 @@ const sketch = (p) => {
 
   p.draw = () => {
     p.translate(-p.width / 2, -p.height / 2);   // WEBGL origin is the centre
-    if (needClear) { p.background(PAPER); needClear = false; }
+    if (needClear) {
+      p.background(PAPER);
+      if (paperTex) p.image(paperTex, 0, 0, W, H);
+      needClear = false;
+    }
     if (!S.fx) return;
     if (!fieldCache) fieldCache = sampleField();   // also sets speedRef
     if (S.running) stepParticles();
@@ -513,7 +743,7 @@ const $ = (id) => document.getElementById(id);
 function populateBrushes() {
   const sel = $("brush");
   sel.innerHTML = "";
-  for (const name of brush.box()) {
+  for (const name of brush.box().filter((n) => !n.startsWith("vf-"))) {
     const o = document.createElement("option");
     o.value = o.textContent = name;
     sel.appendChild(o);
@@ -641,6 +871,31 @@ function wireUI() {
   });
   $("boundary").addEventListener("change", () => (S.boundary = $("boundary").value));
 
+  const styleSel = $("style");
+  for (const [k, v] of Object.entries(STYLES)) {
+    const o = document.createElement("option");
+    o.value = k; o.textContent = v.label;
+    styleSel.appendChild(o);
+  }
+  styleSel.value = S.style;
+  const syncStyle = () => {
+    S.style = styleSel.value;
+    const dry = S.style === "dry";
+    $("brush-row").hidden = !dry;
+    $("dip-row").hidden = dry;
+    $("jitter-row").hidden = dry;
+    $("water-note").hidden = S.style !== "watercolour";
+  };
+  styleSel.addEventListener("change", syncStyle);
+  syncStyle();
+  $("dip").addEventListener("input", () => {
+    S.dipLength = +$("dip").value;
+    $("dip-out").textContent = S.dipLength;
+  });
+  $("jitter").addEventListener("input", () => {
+    S.jitter = +$("jitter").value;
+    $("jitter-out").textContent = S.jitter.toFixed(2);
+  });
   $("brush").addEventListener("change", () => (S.brushName = $("brush").value));
   $("weight").addEventListener("input", () => {
     S.weight = +$("weight").value;
@@ -652,7 +907,9 @@ function wireUI() {
     S.colorMode = $("colormode").value;
     $("ink-fast-row").hidden = S.colorMode !== "speed";
     $("ink-slow-hint").hidden = S.colorMode !== "speed";
+    $("ink").closest("label").hidden = S.colorMode === "palette";   // palette inks are fixed
   });
+  $("colormode").dispatchEvent(new Event("change"));
   $("pressure").addEventListener("change", () => (S.pressureFromSpeed = $("pressure").checked));
   $("curv").addEventListener("input", () => {
     S.curvature = +$("curv").value;

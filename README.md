@@ -32,6 +32,21 @@ to be online: p5.js 2.2.3, p5.brush 2.2.3 and math.js 15.2.0.
 - **Redraw clean** repaints every stored path as long strokes. While the
   simulation runs, paths are drawn in short pieces, which can leave faint
   joins; this button removes them.
+- **Paint styles** (Brush → Style):
+  - *Gouache* (default): an opaque body with a lighter, broken bristle
+    texture dragged over it.
+  - *Bristle paint*: a flat custom brush tip whose dots leave bristle
+    streaks, plus a darker broken pass on top.
+  - *Watercolour*: transparent glazes using p5.brush's watercolour fill,
+    with bleed and darker edges. This is by far the slowest style, so use
+    fewer particles.
+  - *Pencil & ink*: any built-in p5.brush brush (HB, charcoal, marker …).
+
+  Paint is laid in "dips": each stroke covers a set length of path (the
+  **Stroke length** slider), starts with a press, thins as the paint runs
+  out, and overlaps the end of the previous dip. **Colour variation** mixes
+  each dip slightly differently in hue, lightness and saturation. Paper
+  grain is baked under every painting.
 - **Presets**: centre, spiral sink, saddle, Van der Pol, Hopf limit cycle,
   Lotka–Volterra, damped pendulum, cellular flow, double gyre (time-dependent).
 
@@ -41,7 +56,7 @@ to be online: p5.js 2.2.3, p5.brush 2.2.3 and math.js 15.2.0.
 |---|---|
 | Integrator | Fourth-order Runge–Kutta with a fixed step Δt. A particle stops when it leaves the window (or wraps around), comes to rest at a fixed point, reaches its lifetime, or the field returns a non-finite value. |
 | Path recording | Positions are stored in world units, keeping only points at least about 2.5 px apart. |
-| Brush strokes | Each path is cut into chunks and passed to `brush.spline([[x, y, pressure], …])`. Pressure comes from the local speed, so slow stretches draw heavier. |
+| Brush strokes | Each path is cut into strokes. Pencil & ink and bristle paint use `brush.spline([[x, y, pressure], …])`. Gouache and watercolour build a ribbon polygon around the path, with a half-width that follows the pressure, and draw it with `brush.wash` or `brush.fill`. Pressure comes from the local speed, so slow stretches draw heavier. |
 | Draw queue | Strokes wait in a queue that is drained within a 14 ms budget per frame, so heavy redraws don't freeze the controls. |
 | Two layers | The p5 WEBGL canvas is the paper and is never cleared between frames. A plain 2D canvas on top shows field arrows, axes and particle dots, and none of that ends up in the painting. |
 
