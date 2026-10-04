@@ -1,4 +1,4 @@
-# Vector Field Painter
+# BrushFields
 
 Type a 2D velocity field, drop particles into it, and
 [p5.brush](https://github.com/acamposuribe/p5.brush) traces their paths with
@@ -11,10 +11,9 @@ dy/dt = g(x, y, t)
 
 ## Run it
 
-Open `index.html` in a browser, or serve the folder:
+Open `index.html` in a browser, or serve the repository root:
 
 ```bash
-cd vectorfield
 python -m http.server 8000   # then visit http://localhost:8000
 ```
 
