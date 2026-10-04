@@ -11,6 +11,13 @@
 //               and then paints each particle's stroke in progress ("wet"),
 //               from where that stroke began up to the particle, so the
 //               brush is seen travelling with the particle.
+//    layers   — with a finite lifetime and "fade" on, particles born at about
+//               the same time share a framebuffer of their own, white where
+//               nothing is painted, multiplied over paperFB. Once all of its
+//               particles have died the layer fades to white and is dropped,
+//               so the trails vanish with their particles. (p5.brush always
+//               paints opaquely and mixes against white where the target is
+//               transparent, so a transparent layer per particle won't work.)
 //    #overlay — plain 2D canvas: field arrows, axes, particle dots. Kept
 //               separate so it never gets baked into the artwork.
 //
@@ -45,6 +52,8 @@ const CLEAN_CHUNK = 420;        // points per stroke when redrawing cleanly
 const SPEED_CHUNK = 36;         // shorter strokes when colour follows speed
 const FRAME_BUDGET_MS = 14;     // time allowed for brush drawing per frame
 const POINT_GAP = 2.5;          // min px between recorded points (at 600 px)
+const MAX_LAYERS = 6;           // fading layers alive at once (each is a full-size framebuffer)
+const FADE_FRAMES = 80;         // frames a layer takes to fade out
 const STYLES = {
   dry:         { label: "Pencil & ink" },
   bristle:     { label: "Oil (bristle brush)" },
@@ -123,6 +132,7 @@ const S = {
   dt: 0.02,
   stepsPerFrame: 6,
   lifetime: 4000,               // steps; Infinity when the slider is at max
+  fade: true,                   // trails vanish once their particles have died
   running: true,
   boundary: "stop",             // "stop" | "wrap"
   showField: true,
@@ -155,6 +165,9 @@ let fpsSmooth = 60;
 let paperTex = null;            // p5.Graphics with paper grain, drawn on clear
 let paperFB = null;             // p5.Framebuffer with the committed paint
 let commitNow = [];             // finished live strokes, committed this frame
+let layers = [];                // fading layers, oldest first (see layerFor)
+let scratchFB = null;           // a layer plus its wet strokes, rebuilt each frame
+let stepCount = 0;              // integration steps since the last clear
 let nextSeed = 1;               // seeds for brush randomness, one per stroke
 let slowTicks = 0;              // status updates in a row with a low frame rate
 
@@ -230,6 +243,7 @@ function spawn(x, y) {
   const p = {
     x, y, speed: 0, age: 0, stall: 0, alive: true,
     color: inkFor(),
+    layer: layerFor(),  // fading layer it paints into, or null for paperFB
     runs: [[]],         // runs of [x, y, speed] in world units; wrap starts a new run
     sent: 0,            // index in the current run already committed
     dipSeed: 0,         // random seed of the stroke in progress
@@ -288,12 +302,12 @@ function flushParticle(p, final = false) {
   for (;;) {
     const { run, start, full } = wetSpan(p);
     if (run.length - p.sent >= n) {
-      commitStroke(makeStroke(run.slice(start, p.sent + n), p.dipCol, p.dipSeed, full, p.dipBristles));
+      commitStroke(makeStroke(run.slice(start, p.sent + n), p.dipCol, p.dipSeed, full, p.dipBristles), p.layer);
       p.sent += n;
       newDip(p);
     } else {
       if (final && run.length > p.sent) {
-        commitStroke(makeStroke(run.slice(start), p.dipCol, p.dipSeed, 0, p.dipBristles));
+        commitStroke(makeStroke(run.slice(start), p.dipCol, p.dipSeed, 0, p.dipBristles), p.layer);
         p.sent = run.length;
         newDip(p);
       }
@@ -337,6 +351,7 @@ function stepParticles() {
       recordPoint(p);
     }
     S.t += S.dt;
+    stepCount++;
   }
   for (const p of S.particles) if (p.alive) flushParticle(p);
 }
@@ -565,8 +580,9 @@ function makeStroke(worldPts, col, seed, full = 0, bristles = 10) {
 // Live strokes are committed in the frame they finish, so nothing flickers.
 // Watercolour fills are expensive, so they wait in the time-budgeted queue
 // and show a quick wet wash until they are painted.
-function commitStroke(s) {
+function commitStroke(s, layer) {
   if (s.pts.length < 2) return;
+  s.layer = layer;
   if (s.style === "watercolour") drawQueue.push({ ...s, preview: true });
   else commitNow.push(s);
 }
@@ -682,29 +698,75 @@ function flushBrush() {
 // (redraws, watercolour) as fits in the frame budget.
 function paintCommitted() {
   if (!commitNow.length && !drawQueue.length) return;
-  paperFB.draw(() => {
+  const byLayer = new Map();
+  for (const s of commitNow) {
+    if (!byLayer.has(s.layer)) byLayer.set(s.layer, []);
+    byLayer.get(s.layer).push(s);
+  }
+  commitNow = [];
+  for (const [layer, list] of byLayer) paintInto(layer ? layer.fb : paperFB, () => list.forEach((s) => drawSafe(s)));
+  // the backlog, a run of strokes with the same target at a time
+  const t0 = performance.now();
+  const inBudget = () => performance.now() - t0 < FRAME_BUDGET_MS;
+  while (drawQueue.length && inBudget()) {
+    const layer = drawQueue[0].layer;
+    paintInto(layer ? layer.fb : paperFB, () => {
+      while (drawQueue.length && drawQueue[0].layer === layer && inBudget()) drawSafe(drawQueue.shift());
+    });
+  }
+}
+
+// Point p5.brush at a framebuffer, draw, and push the paint through.
+function paintInto(fb, fn) {
+  fb.draw(() => {
     P.translate(-W / 2, -H / 2);
-    brush.load(paperFB);
-    for (const s of commitNow) drawSafe(s);
-    commitNow = [];
-    const t0 = performance.now();
-    while (drawQueue.length && performance.now() - t0 < FRAME_BUDGET_MS) drawSafe(drawQueue.shift());
+    brush.load(fb);
+    fn();
     flushBrush();
   });
   brush.load();
 }
 
-// Strokes still being painted: each live particle's current stroke, and the
-// wet look of watercolour strokes waiting in the queue.
-function paintWet() {
-  if (S.live) {
-    for (const p of S.particles) {
-      if (!p.alive) continue;
-      const { run, start, full } = wetSpan(p);
-      if (run.length - start < 2) continue;
-      drawSafe(makeStroke(run.slice(start), p.dipCol, p.dipSeed, full, p.dipBristles), true);
-    }
+// The current stroke of each live particle that paints into `layer`.
+function wetStrokes(layer) {
+  const out = [];
+  if (!S.live) return out;
+  for (const p of S.particles) {
+    if (!p.alive || p.layer !== layer) continue;
+    const { run, start, full } = wetSpan(p);
+    if (run.length - start < 2) continue;
+    out.push(makeStroke(run.slice(start), p.dipCol, p.dipSeed, full, p.dipBristles));
   }
+  return out;
+}
+
+// Show paperFB, then multiply each fading layer over it. A layer with
+// particles still painting is first copied to scratchFB and their wet strokes
+// are painted onto the copy, so they mix with that layer's paint exactly as
+// they will once committed.
+function showLayers() {
+  P.image(paperFB, -W / 2, -H / 2, W, H);
+  for (const L of layers) {
+    let src = L.fb;
+    const wet = wetStrokes(L);
+    if (wet.length) {
+      scratchFB.draw(() => {
+        P.clear();
+        P.image(L.fb, -W / 2, -H / 2, W, H);
+      });
+      paintInto(scratchFB, () => wet.forEach((s) => drawSafe(s, true)));
+      src = scratchFB;
+    }
+    P.blendMode(P.MULTIPLY);
+    P.image(src, -W / 2, -H / 2, W, H);
+    P.blendMode(P.BLEND);
+  }
+}
+
+// Strokes still being painted straight onto the canvas: live particles that
+// paint into paperFB, and the wet look of watercolour strokes in the queue.
+function paintWet() {
+  for (const s of wetStrokes(null)) drawSafe(s, true);
   for (const s of drawQueue) if (s.preview) drawSafe(s, true);
 }
 
@@ -713,11 +775,67 @@ function clearPaper() {
     P.background(PAPER);
     if (paperTex) P.image(paperTex, -W / 2, -H / 2, W, H);
   });
+  for (const L of layers) L.fresh = true;
+}
+
+// ── Fading layers ─────────────────────────────────────────────────────────────
+// Particles born within a quarter of a lifetime of each other share a layer,
+// so a trail outlasts its particle by at most about that long (less when its
+// layer-mates die sooner). With the lifetime at ∞ or fading off, particles
+// paint into paperFB and their trails stay.
+function layerFor() {
+  if (!S.fade || !Number.isFinite(S.lifetime)) return null;
+  const open = layers.filter((L) => !L.fading).pop();
+  const span = Math.max(60, S.lifetime / 4);
+  if (open && (stepCount - open.born < span || layers.length >= MAX_LAYERS)) return open;
+  const L = { fb: P.createFramebuffer({ width: W, height: H, depth: false }), born: stepCount, fading: 0, fresh: true };
+  layers.push(L);
+  return L;
+}
+
+// A new or cleared layer is white: nothing painted, so multiplying changes nothing.
+function clearFreshLayers() {
+  for (const L of layers) {
+    if (!L.fresh) continue;
+    L.fb.draw(() => P.background(255));
+    L.fresh = false;
+  }
+}
+
+// Start fading a layer once all of its particles have died, and move each
+// fading layer a step closer to white: covering it with white at alpha
+// 1/(frames left) leaves a straight-line fade. Fading pauses with the
+// simulation.
+function updateLayers(running) {
+  for (const L of layers) {
+    if (!L.fading && !S.particles.some((p) => p.layer === L && p.alive)) L.fading = 1;
+  }
+  if (!running) return;
+  for (const L of layers.filter((L) => L.fading)) {
+    if (L.fading >= FADE_FRAMES) { dropLayer(L); continue; }
+    const a = 255 / (FADE_FRAMES - L.fading + 1);
+    L.fb.draw(() => {
+      P.noStroke();
+      P.fill(255, a);
+      P.rect(-W / 2, -H / 2, W, H);
+    });
+    L.fading++;
+  }
+}
+
+// Remove a layer along with its particles and any strokes still waiting for it.
+function dropLayer(L) {
+  layers = layers.filter((x) => x !== L);
+  S.particles = S.particles.filter((p) => p.layer !== L);
+  drawQueue = drawQueue.filter((s) => s.layer !== L);
+  commitNow = commitNow.filter((s) => s.layer !== L);
+  L.fb.remove();
 }
 
 // Re-queue every stored path. Dry media gets long seamless strokes; paint
 // styles are re-laid as dips with fresh colour variation.
 function redrawClean() {
+  for (const L of layers.filter((L) => L.fading)) dropLayer(L);   // already on their way out
   drawQueue = [];
   needClear = true;
   const size = S.style !== "dry" ? strokePoints()
@@ -730,7 +848,7 @@ function redrawClean() {
         const slice = run.slice(Math.max(0, i - back), i + size + 1);
         const base = S.colorMode === "speed" ? speedColor(slice[0][2]) : p.color;
         const col = S.style === "dry" ? base : mixVariation(base);
-        drawQueue.push(makeStroke(slice, col, (nextSeed++ * 2654435761) % 4294967296, 0, 12));
+        drawQueue.push({ ...makeStroke(slice, col, (nextSeed++ * 2654435761) % 4294967296, 0, 12), layer: p.layer });
       }
     }
     p.sent = p.runs[p.runs.length - 1].length;
@@ -739,11 +857,14 @@ function redrawClean() {
 }
 
 function clearAll() {
+  for (const L of layers) L.fb.remove();
+  layers = [];
   S.particles = [];
   drawQueue = [];
   commitNow = [];
   needClear = true;
   S.t = 0;
+  stepCount = 0;
 }
 
 // ── Overlay: field arrows, axes, particle heads ──────────────────────────────
@@ -892,6 +1013,7 @@ const sketch = (p) => {
     populateBrushes();
     paperTex = makePaperTexture();
     paperFB = p.createFramebuffer({ width: W, height: H });
+    scratchFB = p.createFramebuffer({ width: W, height: H, depth: false });
     new ResizeObserver(fitToStage).observe(document.getElementById("stage"));
     loadPreset("vanderpol");
     seedGrid(7, 5);
@@ -899,13 +1021,15 @@ const sketch = (p) => {
 
   p.draw = () => {
     if (needClear) { clearPaper(); needClear = false; }
+    clearFreshLayers();
     if (S.fx) {
       if (!fieldCache) fieldCache = sampleField();   // also sets speedRef
       if (S.running) stepParticles();
     }
     paintCommitted();
+    updateLayers(S.running);
+    showLayers();
     p.translate(-p.width / 2, -p.height / 2);       // WEBGL origin is the centre
-    p.image(paperFB, 0, 0, W, H);
     paintWet();
     drawOverlay();
     fpsSmooth = 0.95 * fpsSmooth + 0.05 * p.frameRate();
@@ -1049,6 +1173,7 @@ function wireUI() {
     S.lifetime = v >= +$("life").max ? Infinity : v;
     $("life-out").textContent = Number.isFinite(S.lifetime) ? S.lifetime : "∞";
   });
+  $("fade").addEventListener("change", () => (S.fade = $("fade").checked));   // applies to new particles
   $("boundary").addEventListener("change", () => (S.boundary = $("boundary").value));
 
   const styleSel = $("style");
