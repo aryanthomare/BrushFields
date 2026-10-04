@@ -1,0 +1,124 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Vector Field Painter</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,700&family=JetBrains+Mono:wght@400;500&family=Public+Sans:wght@400;500;600&display=swap">
+  <link rel="stylesheet" href="style.css">
+  <script src="https://cdn.jsdelivr.net/npm/p5@2.2.3/lib/p5.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/p5.brush@2.2.3/dist/p5.brush.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/mathjs@15.2.0/lib/browser/math.js"></script>
+</head>
+<body>
+<div class="app">
+  <aside class="panel" aria-label="Controls">
+    <header class="masthead">
+      <h1>Vector Field Painter</h1>
+      <p class="lede">Write a velocity field, drop particles in it, and watch a brush trace where they flow.</p>
+    </header>
+
+    <section class="group" aria-labelledby="g-field">
+      <h2 id="g-field">Field</h2>
+      <label class="field-row">
+        <span class="lbl">Preset</span>
+        <select id="preset"></select>
+      </label>
+      <p id="preset-note" class="note"></p>
+
+      <div class="eq">
+        <label for="fx" class="eq-lhs">dx/dt =</label>
+        <input id="fx" type="text" spellcheck="false" autocomplete="off" aria-describedby="eq-help">
+        <label for="fy" class="eq-lhs">dy/dt =</label>
+        <input id="fy" type="text" spellcheck="false" autocomplete="off" aria-describedby="eq-help">
+      </div>
+      <p id="eq-error" class="error" role="alert" hidden></p>
+      <p id="eq-help" class="note">Use <code>x</code>, <code>y</code>, time <code>t</code> and parameters <code>a</code>–<code>d</code>. Functions: <code>sin cos tan exp log sqrt abs atan2 …</code>, powers with <code>^</code>.</p>
+
+      <div class="params">
+        <div class="param"><label for="p-a">a</label><input id="p-a" type="range" min="-2" max="2" step="0.01"><input id="n-a" type="number" step="0.01" aria-label="a value"></div>
+        <div class="param"><label for="p-b">b</label><input id="p-b" type="range" min="-2" max="2" step="0.01"><input id="n-b" type="number" step="0.01" aria-label="b value"></div>
+        <div class="param"><label for="p-c">c</label><input id="p-c" type="range" min="-2" max="2" step="0.01"><input id="n-c" type="number" step="0.01" aria-label="c value"></div>
+        <div class="param"><label for="p-d">d</label><input id="p-d" type="range" min="-2" max="2" step="0.01"><input id="n-d" type="number" step="0.01" aria-label="d value"></div>
+      </div>
+
+      <fieldset class="domain">
+        <legend>Window onto the plane</legend>
+        <label><span>x from</span><input id="xmin" type="number" step="any"></label>
+        <label><span>to</span><input id="xmax" type="number" step="any"></label>
+        <label><span>y from</span><input id="ymin" type="number" step="any"></label>
+        <label><span>to</span><input id="ymax" type="number" step="any"></label>
+      </fieldset>
+      <p id="domain-error" class="error" role="alert" hidden>Each “from” value must be smaller than its “to” value.</p>
+    </section>
+
+    <section class="group" aria-labelledby="g-motion">
+      <h2 id="g-motion">Motion</h2>
+      <label class="slider-row"><span class="lbl">Time step Δt</span><input id="dt" type="range" min="-3" max="-0.7" step="0.01"><output id="dt-out"></output></label>
+      <label class="slider-row"><span class="lbl">Steps per frame</span><input id="speed" type="range" min="1" max="40" step="1" value="6"><output id="speed-out">6</output></label>
+      <label class="slider-row"><span class="lbl">Lifetime (steps)</span><input id="life" type="range" min="200" max="20000" step="100" value="4000"><output id="life-out">4000</output></label>
+      <label class="field-row">
+        <span class="lbl">At the edge</span>
+        <select id="boundary">
+          <option value="stop">Stop the particle</option>
+          <option value="wrap">Wrap to the other side</option>
+        </select>
+      </label>
+    </section>
+
+    <section class="group" aria-labelledby="g-brush">
+      <h2 id="g-brush">Brush</h2>
+      <label class="field-row"><span class="lbl">Brush</span><select id="brush"></select></label>
+      <label class="slider-row"><span class="lbl">Weight</span><input id="weight" type="range" min="0.3" max="4" step="0.1" value="1"><output id="weight-out">1.0</output></label>
+      <label class="field-row">
+        <span class="lbl">Colour</span>
+        <select id="colormode">
+          <option value="single">One ink</option>
+          <option value="palette">Ink per particle</option>
+          <option value="speed">Blend by speed</option>
+        </select>
+      </label>
+      <div class="inks">
+        <label class="swatch"><input id="ink" type="color" value="#1b2a4a"><span>Ink<span id="ink-slow-hint" hidden> (slow)</span></span></label>
+        <label class="swatch" id="ink-fast-row" hidden><input id="ink-fast" type="color" value="#a23b2a"><span>Fast ink</span></label>
+      </div>
+      <label class="check"><input id="pressure" type="checkbox" checked><span>Heavier line where the particle is slow</span></label>
+      <label class="slider-row"><span class="lbl">Curve smoothing</span><input id="curv" type="range" min="0" max="1" step="0.05" value="0.3"><output id="curv-out">0.30</output></label>
+    </section>
+
+    <section class="group" aria-labelledby="g-view">
+      <h2 id="g-view">View</h2>
+      <label class="check"><input id="show-field" type="checkbox" checked><span>Field arrows</span></label>
+      <label class="check"><input id="show-heads" type="checkbox" checked><span>Particle positions</span></label>
+      <p class="note">Arrows and dots sit on a separate layer and never end up in the painting.</p>
+    </section>
+  </aside>
+
+  <main class="work">
+    <div class="toolbar" role="toolbar" aria-label="Simulation">
+      <button id="play" class="primary" type="button" aria-pressed="false">Pause</button>
+      <button id="seed-grid" type="button">Seed grid</button>
+      <button id="seed-rand" type="button">Scatter 30</button>
+      <span class="sep" aria-hidden="true"></span>
+      <button id="redraw" type="button" title="Repaint every path as long, seamless strokes">Redraw clean</button>
+      <button id="clear" type="button">Clear</button>
+      <button id="save" type="button">Save PNG</button>
+    </div>
+    <div id="stage" class="stage">
+      <canvas id="overlay" aria-label="Painting surface. Click to add a particle, drag to add a stream."></canvas>
+    </div>
+    <footer class="status" aria-live="off">
+      <span>t <b id="st-t">0.00</b></span>
+      <span>moving <b id="st-alive">0 / 0</b></span>
+      <span>strokes queued <b id="st-queue">0</b></span>
+      <span>fps <b id="st-fps">–</b></span>
+      <span class="xy">cursor <b id="st-xy">–</b></span>
+      <span class="hint">Click to drop a particle · drag to pour a stream · Space pauses</span>
+    </footer>
+  </main>
+</div>
+<script src="sketch.js"></script>
+</body>
+</html>
