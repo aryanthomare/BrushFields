@@ -5,22 +5,30 @@
 //  drop particles into it, and p5.brush traces where they go.
 //
 //  Layers (bottom to top):
-//    #paper   — p5 WEBGL canvas. p5.brush strokes accumulate here and are
-//               never cleared between frames, so it behaves like real paper.
-//    #overlay — plain 2D canvas, redrawn every frame: field arrows, axes,
-//               particle heads. Kept separate so it never gets baked into
-//               the artwork.
+//    paperFB  — p5 framebuffer holding the finished ("dry") paint. Strokes
+//               are committed here once and never redrawn.
+//    #paper   — the visible p5 WEBGL canvas. Every frame it shows paperFB
+//               and then paints each particle's stroke in progress ("wet"),
+//               from where that stroke began up to the particle, so the
+//               brush is seen travelling with the particle.
+//    #overlay — plain 2D canvas: field arrows, axes, particle dots. Kept
+//               separate so it never gets baked into the artwork.
+//
+//  The wet stroke is redrawn from scratch every frame with a fixed random
+//  seed and colour, so its texture holds still while it grows, and it looks
+//  the same when it is finally committed to paperFB.
 //
 //  Pipeline per frame:
-//    integrate (RK4)  →  record points in world units  →  cut them into
-//    strokes  →  queue  →  drain the queue into p5.brush under a time
-//    budget, so a heavy redraw never freezes the UI.
+//    integrate (RK4)  →  record points in world units  →  commit finished
+//    strokes to paperFB  →  show paperFB  →  paint the wet strokes on top.
 //
 //  Paint styles (see drawPaintStroke):
 //    dry         — one brush.spline with a built-in pencil / ink brush
-//    bristle     — a flat custom tip whose dots leave bristle streaks
-//    gouache     — an opaque body (brush.wash on a ribbon polygon) with a
-//                  lighter bristle pass on top
+//    bristle     — oil-style: a dozen separate bristles, each its own thin
+//                  stroke that wanders, runs dry at its own point, and takes
+//                  a darker or lighter load of paint; a faint body fills gaps
+//    gouache     — an opaque body (brush.wash on a ribbon polygon) with the
+//                  same bristles dragged through it for texture
 //    watercolour — a ribbon polygon with p5.brush's watercolour fill
 //  Paint strokes are "dips": a fixed length of path, tapered at both ends,
 //  each with a slightly different mix of the colour.
@@ -32,14 +40,14 @@ const PAPER = "#f3f2ee";
 const PALETTE = ["#1b2a4a", "#a23b2a", "#2f6b4f", "#b8862b", "#5b3f7a", "#1f6f8b", "#3a3a3a"];
 const BASE_SIZE = 600;          // brush.scaleBrushes(3) looks right at 600 px
 const MAX_PARTICLES = 400;
-const LIVE_CHUNK = 24;          // points per live brush stroke
+const LIVE_CHUNK = 24;          // points per pencil stroke when the live brush is off
 const CLEAN_CHUNK = 420;        // points per stroke when redrawing cleanly
 const SPEED_CHUNK = 36;         // shorter strokes when colour follows speed
 const FRAME_BUDGET_MS = 14;     // time allowed for brush drawing per frame
 const POINT_GAP = 2.5;          // min px between recorded points (at 600 px)
 const STYLES = {
   dry:         { label: "Pencil & ink" },
-  bristle:     { label: "Bristle paint" },
+  bristle:     { label: "Oil (bristle brush)" },
   gouache:     { label: "Gouache" },
   watercolour: { label: "Watercolour" },
 };
@@ -118,8 +126,9 @@ const S = {
   running: true,
   boundary: "stop",             // "stop" | "wrap"
   showField: true,
-  showHeads: true,
+  showHeads: false,
   style: "gouache",
+  live: true,                   // paint the stroke in progress every frame
   brushName: "HB",              // built-in brush used by the "dry" style
   dipLength: 170,               // px of path per paint stroke
   jitter: 0.5,                  // 0–1 colour variation between paint strokes
@@ -144,6 +153,10 @@ let needRedraw = false;
 let fieldCache = null;          // quiver samples
 let fpsSmooth = 60;
 let paperTex = null;            // p5.Graphics with paper grain, drawn on clear
+let paperFB = null;             // p5.Framebuffer with the committed paint
+let commitNow = [];             // finished live strokes, committed this frame
+let nextSeed = 1;               // seeds for brush randomness, one per stroke
+let slowTicks = 0;              // status updates in a row with a low frame rate
 
 // ── Coordinate mapping (world ↔ pixels, y up in world) ───────────────────────
 const sx = () => W / (S.domain.xmax - S.domain.xmin);
@@ -218,8 +231,11 @@ function spawn(x, y) {
     x, y, speed: 0, age: 0, stall: 0, alive: true,
     color: inkFor(),
     runs: [[]],         // runs of [x, y, speed] in world units; wrap starts a new run
-    sent: 0,            // index in the current run already queued for drawing
+    sent: 0,            // index in the current run already committed
+    dipSeed: 0,         // random seed of the stroke in progress
+    dipCol: "#000000",  // colour of the stroke in progress
   };
+  newDip(p);
   recordPoint(p, true);
   S.particles.push(p);
 }
@@ -235,11 +251,28 @@ function recordPoint(p, force = false) {
   run.push([p.x, p.y, p.speed]);
 }
 
-// Points per stroke while the simulation runs. Dry media draws short pieces
-// so the trace keeps up with the particle; paint draws whole "dips".
+// Points per stroke. Each stroke is one "dip" of the brush. Without the live
+// brush, pencil strokes stay short so the trace keeps up with the particle.
 function strokePoints() {
-  if (S.style === "dry") return LIVE_CHUNK;
+  if (S.style === "dry" && !S.live) return LIVE_CHUNK;
   return Math.max(8, Math.round(S.dipLength / POINT_GAP));
+}
+
+// Start a new stroke for p: a fresh seed for the brush texture and a fresh
+// mix of the colour. Both stay fixed while the stroke is painted.
+function newDip(p) {
+  p.dipSeed = (nextSeed++ * 2654435761) % 4294967296;
+  const base = S.colorMode === "speed" ? speedColor(p.speed) : p.color;
+  p.dipCol = S.style === "dry" ? base : mixVariation(base);
+  p.dipBristles = bristleCount();
+}
+
+// The part of p's current run that belongs to the stroke in progress, and the
+// length that stroke will have once finished (so its taper is stable).
+function wetSpan(p) {
+  const run = p.runs[p.runs.length - 1];
+  const start = Math.max(0, p.sent - strokeOverlap());
+  return { run, start, full: p.sent + strokePoints() - start };
 }
 
 // How far a stroke reaches back into the previous one. Paint strokes overlap
@@ -248,19 +281,24 @@ function strokeOverlap() {
   return S.style === "dry" ? 1 : Math.round(strokePoints() * 0.18);
 }
 
-// Queue the not-yet-drawn tail of the current run as strokes. With
-// final = true the leftover short tail is queued as well.
+// Commit every finished stroke of the current run. With final = true the
+// stroke in progress is finished too, tapering to wherever the path ended.
 function flushParticle(p, final = false) {
-  const run = p.runs[p.runs.length - 1];
-  const n = strokePoints(), back = strokeOverlap();
-  while (run.length - p.sent >= n) {
-    const end = p.sent + n;
-    queueStroke(run.slice(Math.max(0, p.sent - back), end), p.color);
-    p.sent = end;
-  }
-  if (final && run.length > p.sent) {
-    queueStroke(run.slice(Math.max(0, p.sent - back)), p.color);
-    p.sent = run.length;
+  const n = strokePoints();
+  for (;;) {
+    const { run, start, full } = wetSpan(p);
+    if (run.length - p.sent >= n) {
+      commitStroke(makeStroke(run.slice(start, p.sent + n), p.dipCol, p.dipSeed, full, p.dipBristles));
+      p.sent += n;
+      newDip(p);
+    } else {
+      if (final && run.length > p.sent) {
+        commitStroke(makeStroke(run.slice(start), p.dipCol, p.dipSeed, 0, p.dipBristles));
+        p.sent = run.length;
+        newDip(p);
+      }
+      return;
+    }
   }
 }
 
@@ -372,39 +410,103 @@ function mixVariation(hex) {
 
 // ── Paint brushes ─────────────────────────────────────────────────────────────
 // Registered before scaleBrushes() so they scale with the built-ins.
-// A custom tip is drawn in a 100 × 100 space; dark = paint, white = none.
-// With rotate: "natural" the tip's y axis lies across the stroke, so a column
-// of dots along y becomes a flat brush whose dots leave bristle streaks.
-function bristleTip(m, seed, gapChance, underlay) {
-  let s = seed;
-  const rnd = (a, b) => {                       // small deterministic generator
-    s = (s * 16807) % 2147483647;
-    return a + (b - a) * ((s - 1) / 2147483646);
+// One bristle is a small soft marker dot stamped along its own path; many
+// overlapping bristles make up a stroke (see paintBristles).
+const HAIR_WEIGHT = 1.6;        // vf-hair weight before scaling
+function addPaintBrushes() {
+  brush.add("vf-hair", {
+    type: "marker", weight: HAIR_WEIGHT, scatter: 0.04, opacity: 70, spacing: 0.25,
+    pressure: [1, 1], noise: 0.4, markerTip: false,
+  });
+}
+
+// Small seeded generator, so a stroke's bristle layout is identical on every
+// frame it is redrawn.
+function mulberry32(a) {
+  return () => {
+    a |= 0; a = (a + 0x6d2b79f5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
   };
-  if (underlay) { m.fill(0, underlay); m.rect(-3, -44, 6, 88); }
-  for (let y = -46; y < 46;) {
-    const r = rnd(1.4, 3.4);
-    if (rnd(0, 1) > gapChance) {
-      m.fill(0, rnd(160, 255));
-      m.ellipse(rnd(-1.5, 1.5), y, r * 2.6, r * 1.1);
+}
+
+function normalsOf(pts) {
+  const last = pts.length - 1;
+  return pts.map((_, i) => {
+    const a = pts[Math.max(0, i - 1)], b = pts[Math.min(last, i + 1)];
+    const dx = b[0] - a[0], dy = b[1] - a[1], len = Math.hypot(dx, dy) || 1;
+    return [-dy / len, dx / len];
+  });
+}
+
+// A brush stroke built from separate bristles. Each bristle:
+//   · sits at its own offset across the stroke, scaled by pressure, so the
+//     brush splays when pressed and narrows as it lifts;
+//   · wanders slightly, so the grooves between bristles come and go;
+//   · starts a little late and runs dry at its own point, edges first, which
+//     gives the ragged dry-brush end;
+//   · carries a darker, plain or lighter load of paint. Outer bristles are
+//     dark, like the ridge of paint pushed to the edge of a real stroke.
+// Bristles of one shade are drawn back to back so p5.brush blends them in a
+// single pass. Each bristle has its own seeds (see seededSpline), so its
+// texture never depends on how long it or the other bristles currently are.
+function paintBristles(s, halfW, count) {
+  const rnd = mulberry32(s.seed);
+  const n = normalsOf(s.pts);
+  const N = s.pts.length;
+  const groups = [[], [], []];
+  for (let b = 0; b < count; b++) {
+    const across = b / (count - 1) - 0.5;                       // -0.5 … 0.5
+    const edge = Math.abs(across) * 2;                          // 0 centre … 1 edge
+    const off = across * 2 * halfW * 0.9 + (rnd() - 0.5) * halfW * 0.15;
+    const uEnd = 1.02 - edge * 0.25 - rnd() * 0.25;
+    const uStart = rnd() * 0.025;
+    const amp = halfW * 0.05 * rnd(), freq = 0.05 + rnd() * 0.08, phase = rnd() * 6.283;
+    const group = edge > 0.8 ? 0 : rnd() < 0.45 ? 2 : 1;
+    const width = ((2 * halfW * 1.7) / count) / (HAIR_WEIGHT * brushScale) *
+      (edge > 0.8 ? 1.15 : 1) * (0.75 + rnd() * 0.5);
+    const path = [];
+    for (let i = 0; i < N; i++) {
+      const u = s.us[i];
+      if (u < uStart || u > uEnd) continue;
+      const dry = Math.min(1, Math.max(0, (u - (uEnd - 0.2)) / 0.2));  // lifting off near its end
+      const pr = s.pts[i][2];
+      const o = off * pr + amp * Math.sin(phase + i * freq);
+      path.push([s.pts[i][0] + n[i][0] * o, s.pts[i][1] + n[i][1] * o, pr * (1 - 0.5 * dry)]);
     }
-    y += r * rnd(1.0, 1.7);
+    if (path.length > 2) groups[group].push({ path, width, seed: s.seed + 101 * (b + 1) });
+  }
+  const shades = [shade(s.col, -0.08), s.col, shade(s.col, 0.07, 0, -0.05)];
+  groups.forEach((g, gi) => {
+    for (const h of g) {
+      brush.set("vf-hair", shades[gi], h.width);
+      seededSpline(h.path, h.seed);
+    }
+  });
+}
+
+// Draw a path as a run of fixed-length pieces, each with its own seed.
+// p5.brush sizes a pool of random values by the length of each stroke before
+// stamping it, so a growing stroke would get a new texture along its whole
+// length every frame. Pieces of fixed length come out identical every time;
+// only the piece at the brush head changes as it grows. Pieces of one colour
+// share a blend pass, so there are no seams.
+const PIECE = 12;               // points per piece (~30 px)
+function seededSpline(path, seedBase) {
+  for (let j = 0; j < path.length - 1; j += PIECE) {
+    const piece = path.slice(j, j + PIECE + 1);
+    if (piece.length < 2) break;
+    brush.seed(seedBase + 7919 * (j + 1));
+    brush.spline(piece, S.curvature);
   }
 }
 
-function addPaintBrushes() {
-  // dense flat brush: loaded with paint, faint streaks
-  brush.add("vf-flat", {
-    type: "custom", weight: 5.5, scatter: 0.05, opacity: 200, spacing: 0.14,
-    pressure: [1.05, 1, 0.9], rotate: "natural", markerTip: false, noise: 0.4,
-    tip: (m) => bristleTip(m, 6, 0.15, 60),
-  });
-  // sparse flat brush: the dry, broken texture laid over gouache
-  brush.add("vf-dry", {
-    type: "custom", weight: 9, scatter: 0.08, opacity: 200, spacing: 0.2,
-    pressure: [1, 1, 0.85], rotate: "natural", markerTip: false, noise: 0.5,
-    tip: (m) => bristleTip(m, 13, 0.45, 0),
-  });
+// Fewer bristles when many particles paint at once, to bound the work per
+// frame. Fixed for each stroke when it starts, so a stroke never changes.
+function bristleCount() {
+  const alive = S.particles.reduce((c, p) => c + (p.alive ? 1 : 0), 0);
+  return Math.max(7, Math.min(12, Math.round(240 / Math.max(1, alive))));
 }
 
 // Paper grain: per-pixel tooth, soft blotches and a few fibres, baked under
@@ -444,21 +546,29 @@ function makePaperTexture() {
   return g;
 }
 
-function queueStroke(worldPts, color) {
-  if (worldPts.length < 2) return;
-  let col = color;
-  if (S.colorMode === "speed") {
-    const mean = worldPts.reduce((s, q) => s + q[2], 0) / worldPts.length;
-    col = speedColor(mean);
-  }
-  if (S.style !== "dry") col = mixVariation(col);
-  const n = worldPts.length;
+// Turn a slice of recorded path into a drawable stroke. `full` is the length
+// the stroke will have when finished; the pressure envelope is laid out over
+// that length so a growing wet stroke keeps the same shape.
+function makeStroke(worldPts, col, seed, full = 0, bristles = 10) {
+  const n = full || worldPts.length;
+  const us = [];
   const pts = worldPts.map(([x, y, s], i) => {
     const [px, py] = toPx(x, y);
-    const taper = S.style === "dry" ? 1 : dipEnvelope(n > 1 ? i / (n - 1) : 0, n);
+    const u = n > 1 ? i / (n - 1) : 0;
+    us.push(u);
+    const taper = S.style === "dry" ? 1 : dipEnvelope(u, n);
     return [px, py, pressureFor(s) * taper];
   });
-  drawQueue.push({ pts, col, style: S.style, brushName: S.brushName, weight: S.weight });
+  return { pts, us, col, seed, bristles, style: S.style, brushName: S.brushName, weight: S.weight };
+}
+
+// Live strokes are committed in the frame they finish, so nothing flickers.
+// Watercolour fills are expensive, so they wait in the time-budgeted queue
+// and show a quick wet wash until they are painted.
+function commitStroke(s) {
+  if (s.pts.length < 2) return;
+  if (s.style === "watercolour") drawQueue.push({ ...s, preview: true });
+  else commitNow.push(s);
 }
 
 // Pressure along one dip: a quick press at the start, full body, then the
@@ -477,8 +587,9 @@ function dipEnvelope(u, n) {
 // Outline of a stroke as a closed polygon: offset each point along its normal
 // by a half-width that follows the pressure. Only every `step`-th point is
 // used: p5.brush's watercolour fill subdivides every edge, so fewer vertices
-// make it much cheaper.
-function ribbon(pts, halfWidth, step = 2) {
+// make it much cheaper. With `us` given, the body starts narrow and thins
+// over the last fifth of the stroke, where the brush is running out of paint.
+function ribbon(pts, halfWidth, step = 2, us = null) {
   const left = [], right = [];
   const last = pts.length - 1;
   const idx = [];
@@ -489,33 +600,46 @@ function ribbon(pts, halfWidth, step = 2) {
     let nx = -(b[1] - a[1]), ny = b[0] - a[0];
     const len = Math.hypot(nx, ny) || 1;
     nx /= len; ny /= len;
-    const w = halfWidth * pts[i][2] * (1 + 0.08 * Math.sin(i * 0.7));   // slight wobble at the edge
+    let w = halfWidth * pts[i][2] * (1 + 0.08 * Math.sin(i * 0.7));     // slight wobble at the edge
+    if (us) {
+      const d = Math.min(1, Math.max(0, (us[i] - 0.8) / 0.2));
+      w *= 1 - 0.75 * d * d * (3 - 2 * d);                               // smoothstep down to a dry tail
+      const a = Math.min(1, us[i] / 0.06);
+      w *= 0.35 + 0.65 * a * a * (3 - 2 * a);                            // rounded start, under the bristles
+    }
     left.push([pts[i][0] + nx * w, pts[i][1] + ny * w]);
     right.push([pts[i][0] - nx * w, pts[i][1] - ny * w]);
   }
   return left.concat(right.reverse());
 }
 
-function drawStroke(s) {
+function drawStroke(s, wet = false) {
   const k = pxScale();
+  brush.seed(s.seed);                 // same texture every time this stroke is drawn
+  if (wet && s.style === "watercolour") {
+    // still wet: a quick translucent wash; the full watercolour fill comes later
+    brush.noStroke();
+    brush.wash(s.col, 70);
+    brush.polygon(ribbon(s.pts, 6 * k * s.weight, 3));
+    brush.noWash();
+    return;
+  }
   switch (s.style) {
     case "bristle":
-      brush.set("vf-flat", s.col, s.weight);
-      brush.spline(s.pts, S.curvature);
-      // a second, darker and broken pass: paint picked up unevenly by the bristles
-      brush.set("vf-dry", shade(s.col, -0.06), s.weight * 0.6);
-      brush.spline(s.pts, S.curvature);
-      break;
-    case "gouache": {
+      // a thin film of paint between the bristles, then the bristles
       brush.noStroke();
-      brush.wash(s.col, 215);
-      brush.polygon(ribbon(s.pts, 5.2 * k * s.weight));
+      brush.wash(s.col, 60);
+      brush.polygon(ribbon(s.pts, 5.4 * k * s.weight, 2, s.us));
       brush.noWash();
-      // lighter, broken bristle texture dragged over the wet body
-      brush.set("vf-dry", shade(s.col, 0.09, 0, -0.05), s.weight * 0.85);
-      brush.spline(s.pts, S.curvature);
+      paintBristles(s, 6 * k * s.weight, s.bristles);
       break;
-    }
+    case "gouache":
+      brush.noStroke();
+      brush.wash(s.col, 165);
+      brush.polygon(ribbon(s.pts, 5.6 * k * s.weight, 2, s.us));
+      brush.noWash();
+      paintBristles(s, 6 * k * s.weight, Math.max(6, s.bristles - 2));
+      break;
     case "watercolour":
       brush.noStroke();
       brush.fill(s.col, 90);
@@ -526,23 +650,69 @@ function drawStroke(s) {
       break;
     default:
       brush.set(s.brushName, s.col, s.weight);
-      brush.spline(s.pts, S.curvature);
+      seededSpline(s.pts, s.seed);
   }
 }
 
-function drainQueue() {
-  const t0 = performance.now();
-  while (drawQueue.length && performance.now() - t0 < FRAME_BUDGET_MS) {
-    const s = drawQueue.shift();
-    // a stroke whose points all coincide makes p5.brush throw; skip it
-    const [a, b] = [s.pts[0], s.pts[s.pts.length - 1]];
-    if (s.pts.length === 2 && Math.hypot(a[0] - b[0], a[1] - b[1]) < 0.5) continue;
-    try {
-      drawStroke(s);
-    } catch (err) {
-      console.warn("stroke skipped:", err.message);
+function drawSafe(s, wet = false) {
+  // a stroke whose points all coincide makes p5.brush throw; skip it
+  const [a, b] = [s.pts[0], s.pts[s.pts.length - 1]];
+  if (s.pts.length < 2 || (s.pts.length === 2 && Math.hypot(a[0] - b[0], a[1] - b[1]) < 0.5)) return;
+  try {
+    drawStroke(s, wet);
+  } catch (err) {
+    console.warn("stroke skipped:", err.message);
+  }
+}
+
+// p5.brush holds the last operation's paint until the next operation of a
+// different kind (or the end of the frame on the main canvas). Before leaving
+// an offscreen target, two invisible off-canvas marks of different kinds push
+// everything real through.
+function flushBrush() {
+  brush.noStroke();
+  brush.wash("#ffffff", 1);
+  brush.polygon([[-60, -60], [-50, -60], [-50, -50]]);
+  brush.noWash();
+  brush.set("pen", "#ffffff", 0.1);
+  brush.line(-60, -40, -50, -40);
+}
+
+// Commit this frame's finished strokes, then as much of the backlog
+// (redraws, watercolour) as fits in the frame budget.
+function paintCommitted() {
+  if (!commitNow.length && !drawQueue.length) return;
+  paperFB.draw(() => {
+    P.translate(-W / 2, -H / 2);
+    brush.load(paperFB);
+    for (const s of commitNow) drawSafe(s);
+    commitNow = [];
+    const t0 = performance.now();
+    while (drawQueue.length && performance.now() - t0 < FRAME_BUDGET_MS) drawSafe(drawQueue.shift());
+    flushBrush();
+  });
+  brush.load();
+}
+
+// Strokes still being painted: each live particle's current stroke, and the
+// wet look of watercolour strokes waiting in the queue.
+function paintWet() {
+  if (S.live) {
+    for (const p of S.particles) {
+      if (!p.alive) continue;
+      const { run, start, full } = wetSpan(p);
+      if (run.length - start < 2) continue;
+      drawSafe(makeStroke(run.slice(start), p.dipCol, p.dipSeed, full, p.dipBristles), true);
     }
   }
+  for (const s of drawQueue) if (s.preview) drawSafe(s, true);
+}
+
+function clearPaper() {
+  paperFB.draw(() => {
+    P.background(PAPER);
+    if (paperTex) P.image(paperTex, -W / 2, -H / 2, W, H);
+  });
 }
 
 // Re-queue every stored path. Dry media gets long seamless strokes; paint
@@ -557,16 +727,21 @@ function redrawClean() {
     if (S.colorMode === "single") p.color = S.ink;
     for (const run of p.runs) {
       for (let i = 0; i < run.length - 1; i += size) {
-        queueStroke(run.slice(Math.max(0, i - back), i + size + 1), p.color);
+        const slice = run.slice(Math.max(0, i - back), i + size + 1);
+        const base = S.colorMode === "speed" ? speedColor(slice[0][2]) : p.color;
+        const col = S.style === "dry" ? base : mixVariation(base);
+        drawQueue.push(makeStroke(slice, col, (nextSeed++ * 2654435761) % 4294967296, 0, 12));
       }
     }
     p.sent = p.runs[p.runs.length - 1].length;
+    newDip(p);
   }
 }
 
 function clearAll() {
   S.particles = [];
   drawQueue = [];
+  commitNow = [];
   needClear = true;
   S.t = 0;
 }
@@ -600,16 +775,16 @@ function drawOverlay() {
   octx.setTransform(dpr, 0, 0, dpr, 0, 0);
   octx.clearRect(0, 0, W, H);
 
-  // axes through the origin when it is in view
-  const [ox, oy] = toPx(0, 0);
-  octx.strokeStyle = "rgba(40, 52, 70, 0.28)";
-  octx.lineWidth = 1;
-  octx.beginPath();
-  if (oy >= 0 && oy <= H) { octx.moveTo(0, oy); octx.lineTo(W, oy); }
-  if (ox >= 0 && ox <= W) { octx.moveTo(ox, 0); octx.lineTo(ox, H); }
-  octx.stroke();
-
   if (S.showField) {
+    // axes through the origin when it is in view
+    const [ox, oy] = toPx(0, 0);
+    octx.strokeStyle = "rgba(40, 52, 70, 0.28)";
+    octx.lineWidth = 1;
+    octx.beginPath();
+    if (oy >= 0 && oy <= H) { octx.moveTo(0, oy); octx.lineTo(W, oy); }
+    if (ox >= 0 && ox <= W) { octx.moveTo(ox, 0); octx.lineTo(ox, H); }
+    octx.stroke();
+
     if (!fieldCache || S.timeDependent) fieldCache = sampleField();
     const { pts, cell, maxM } = fieldCache;
     for (const a of pts) {
@@ -643,6 +818,7 @@ function drawOverlay() {
     }
   }
 
+  if (!S.showField) return;
   // domain labels in the corners
   octx.fillStyle = "rgba(40, 52, 70, 0.6)";
   octx.font = "11px 'JetBrains Mono', ui-monospace, monospace";
@@ -715,22 +891,22 @@ const sketch = (p) => {
     applyBrushScale();
     populateBrushes();
     paperTex = makePaperTexture();
+    paperFB = p.createFramebuffer({ width: W, height: H });
     new ResizeObserver(fitToStage).observe(document.getElementById("stage"));
     loadPreset("vanderpol");
     seedGrid(7, 5);
   };
 
   p.draw = () => {
-    p.translate(-p.width / 2, -p.height / 2);   // WEBGL origin is the centre
-    if (needClear) {
-      p.background(PAPER);
-      if (paperTex) p.image(paperTex, 0, 0, W, H);
-      needClear = false;
+    if (needClear) { clearPaper(); needClear = false; }
+    if (S.fx) {
+      if (!fieldCache) fieldCache = sampleField();   // also sets speedRef
+      if (S.running) stepParticles();
     }
-    if (!S.fx) return;
-    if (!fieldCache) fieldCache = sampleField();   // also sets speedRef
-    if (S.running) stepParticles();
-    drainQueue();
+    paintCommitted();
+    p.translate(-p.width / 2, -p.height / 2);       // WEBGL origin is the centre
+    p.image(paperFB, 0, 0, W, H);
+    paintWet();
     drawOverlay();
     fpsSmooth = 0.95 * fpsSmooth + 0.05 * p.frameRate();
     if (p.frameCount % 10 === 0) updateStatus();
@@ -826,6 +1002,10 @@ function updateStatus() {
   $("st-alive").textContent = `${alive} / ${S.particles.length}`;
   $("st-queue").textContent = drawQueue.length;
   $("st-fps").textContent = Math.round(fpsSmooth);
+  // live painting redraws every stroke in progress each frame; say so when
+  // that is what is slowing the page down
+  slowTicks = S.live && S.running && alive > 8 && fpsSmooth < 15 ? slowTicks + 1 : 0;
+  $("perf-note").hidden = slowTicks < 20;
 }
 
 function wireUI() {
@@ -882,7 +1062,7 @@ function wireUI() {
     S.style = styleSel.value;
     const dry = S.style === "dry";
     $("brush-row").hidden = !dry;
-    $("dip-row").hidden = dry;
+    $("dip-row").hidden = dry && !S.live;
     $("jitter-row").hidden = dry;
     $("water-note").hidden = S.style !== "watercolour";
   };
@@ -915,7 +1095,15 @@ function wireUI() {
     S.curvature = +$("curv").value;
     $("curv-out").textContent = S.curvature.toFixed(2);
   });
-  $("show-field").addEventListener("change", () => (S.showField = $("show-field").checked));
+  const syncField = () => {
+    $("show-field").checked = S.showField;
+    $("toggle-field").textContent = S.showField ? "Hide field" : "Show field";
+    $("toggle-field").setAttribute("aria-pressed", String(!S.showField));
+  };
+  $("show-field").addEventListener("change", () => { S.showField = $("show-field").checked; syncField(); });
+  $("toggle-field").addEventListener("click", () => { S.showField = !S.showField; syncField(); });
+  syncField();
+  $("live").addEventListener("change", () => { S.live = $("live").checked; syncStyle(); });
   $("show-heads").addEventListener("change", () => (S.showHeads = $("show-heads").checked));
 
   $("play").addEventListener("click", () => {

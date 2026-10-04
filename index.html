@@ -71,6 +71,7 @@
     <section class="group" aria-labelledby="g-brush">
       <h2 id="g-brush">Brush</h2>
       <label class="field-row"><span class="lbl">Style</span><select id="style"></select></label>
+      <label class="check"><input id="live" type="checkbox" checked><span>Live brush: paint each stroke as the particle moves</span></label>
       <label class="field-row" id="brush-row"><span class="lbl">Brush</span><select id="brush"></select></label>
       <label class="slider-row" id="dip-row"><span class="lbl">Stroke length</span><input id="dip" type="range" min="40" max="420" step="10" value="170"><output id="dip-out">170</output></label>
       <label class="slider-row" id="jitter-row"><span class="lbl">Colour variation</span><input id="jitter" type="range" min="0" max="1" step="0.05" value="0.5"><output id="jitter-out">0.50</output></label>
@@ -94,8 +95,8 @@
 
     <section class="group" aria-labelledby="g-view">
       <h2 id="g-view">View</h2>
-      <label class="check"><input id="show-field" type="checkbox" checked><span>Field arrows</span></label>
-      <label class="check"><input id="show-heads" type="checkbox" checked><span>Particle positions</span></label>
+      <label class="check"><input id="show-field" type="checkbox" checked><span>Field arrows and axes</span></label>
+      <label class="check"><input id="show-heads" type="checkbox"><span>Particle positions</span></label>
       <p class="note">Arrows and dots sit on a separate layer and never end up in the painting.</p>
     </section>
   </aside>
@@ -106,6 +107,7 @@
       <button id="seed-grid" type="button">Seed grid</button>
       <button id="seed-rand" type="button">Scatter 30</button>
       <span class="sep" aria-hidden="true"></span>
+      <button id="toggle-field" type="button" aria-pressed="false">Hide field</button>
       <button id="redraw" type="button" title="Repaint every path as long, seamless strokes">Redraw clean</button>
       <button id="clear" type="button">Clear</button>
       <button id="save" type="button">Save PNG</button>
@@ -119,6 +121,7 @@
       <span>strokes queued <b id="st-queue">0</b></span>
       <span>fps <b id="st-fps">–</b></span>
       <span class="xy">cursor <b id="st-xy">–</b></span>
+      <span id="perf-note" class="perf" hidden>Painting is slow on this device. Use fewer particles or turn off Live brush.</span>
       <span class="hint">Click to drop a particle · drag to pour a stream · Space pauses</span>
     </footer>
   </main>

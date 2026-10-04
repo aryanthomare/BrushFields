@@ -188,6 +188,7 @@ button.primary { background: var(--accent); color: var(--accent-fg); border-colo
 }
 .status b { font: 500 var(--step--1) var(--font-mono); color: var(--fg); font-variant-numeric: tabular-nums; }
 .status .hint { margin-left: auto; }
+.status .perf { color: var(--danger); font-weight: 500; }
 
 @media (max-width: 760px) {
   html, body { height: auto; }
