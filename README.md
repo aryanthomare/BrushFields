@@ -17,6 +17,10 @@ Open `index.html` in a browser, or serve the repository root:
 python -m http.server 8000   # then visit http://localhost:8000
 ```
 
+After pulling an update, reload with **Ctrl+Shift+R** (Cmd+Shift+R on a Mac)
+so the browser drops any cached copy. `index.html` loads `sketch.js?v=N` and
+`style.css?v=N`; bump `N` when you change either file.
+
 The libraries load from the jsDelivr content delivery network, so you need
 to be online: p5.js 2.2.3, p5.brush 2.2.3 and math.js 15.2.0.
 
