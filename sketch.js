@@ -208,6 +208,11 @@ function compileEquations(fxStr, fyStr) {
     }
     S.fx = cx; S.fy = cy;
     S.timeDependent = usesT(nx) || usesT(ny);
+    // remembered for saved file names: the equations that are actually running
+    S.fxText = fxStr.trim();
+    S.fyText = fyStr.trim();
+    const symbols = new Set([...nx.filter((n) => n.isSymbolNode), ...ny.filter((n) => n.isSymbolNode)].map((n) => n.name));
+    S.paramsUsed = ["a", "b", "c", "d"].filter((k) => symbols.has(k));
     fieldCache = null;
     return null;
   } catch (err) {
@@ -913,6 +918,123 @@ const sketch = (p) => {
   };
 };
 
+// ── Saving ────────────────────────────────────────────────────────────────────
+// The file name carries the equations, the parameters they use and a
+// millisecond timestamp, e.g.
+//   dx=y__dy=a (1-x^2) y-x__a=1__2026-10-04_23-05-12-345.png
+// Names are kept to plain ASCII: browsers fall back to "download" for names
+// they cannot map to the file system, and some do for any non-ASCII
+// character. So * becomes a space (written like maths, "a (1-x^2) y"),
+// / becomes " over ", and characters file systems reject become "_".
+// Very long equations are shortened in the name, so the full, untouched
+// equations are also written into the PNG's own Title and Description
+// text fields.
+const MAX_NAME_BYTES = 200;     // most file systems allow 255 bytes per name; names are ASCII
+let lastStamp = "", stampRepeat = 0;
+
+function paramText(sep) {
+  return (S.paramsUsed || []).map((k) => `${k}${sep}${+S.scope[k].toFixed(4)}`);
+}
+
+function fileSafe(str) {
+  return str
+    .replace(/\s+/g, "")
+    .replace(/\*/g, " ")
+    .replace(/\//g, " over ")
+    .replace(/[\\:?"<>|]|[^\x20-\x7e]/g, "_");
+}
+
+// Cut an ASCII string to at most `max` characters, marking the cut with "...".
+function clipName(str, max) {
+  return str.length <= max ? str : str.slice(0, max - 3) + "...";
+}
+
+// Local time to the millisecond. Two saves in the same millisecond get a
+// suffix, so no two names from this page are ever the same.
+function uniqueStamp() {
+  const d = new Date(), z = (n, w = 2) => String(n).padStart(w, "0");
+  const stamp = `${d.getFullYear()}-${z(d.getMonth() + 1)}-${z(d.getDate())}_` +
+    `${z(d.getHours())}-${z(d.getMinutes())}-${z(d.getSeconds())}-${z(d.getMilliseconds(), 3)}`;
+  stampRepeat = stamp === lastStamp ? stampRepeat + 1 : 0;
+  lastStamp = stamp;
+  return stampRepeat ? `${stamp}-${stampRepeat + 1}` : stamp;
+}
+
+function pngFileName() {
+  const parts = [`dx=${fileSafe(S.fxText)}`, `dy=${fileSafe(S.fyText)}`, ...paramText("=")];
+  const stamp = uniqueStamp();
+  const budget = MAX_NAME_BYTES - `__${stamp}.png`.length;
+  return `${clipName(parts.join("__"), budget)}__${stamp}.png`;
+}
+
+// ── PNG text chunks ──
+const CRC_TABLE = (() => {
+  const t = new Uint32Array(256);
+  for (let n = 0; n < 256; n++) {
+    let c = n;
+    for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+    t[n] = c >>> 0;
+  }
+  return t;
+})();
+
+function crc32(bytes) {
+  let c = 0xffffffff;
+  for (const b of bytes) c = CRC_TABLE[(c ^ b) & 0xff] ^ (c >>> 8);
+  return (c ^ 0xffffffff) >>> 0;
+}
+
+// An iTXt chunk (UTF-8 text) with the given keyword.
+function textChunk(keyword, text) {
+  const enc = new TextEncoder();
+  const data = [...enc.encode(keyword), 0, 0, 0, 0, 0, ...enc.encode(text)];
+  const type = [...enc.encode("iTXt")];
+  const out = new Uint8Array(12 + data.length);
+  const view = new DataView(out.buffer);
+  view.setUint32(0, data.length);
+  out.set(type, 4);
+  out.set(data, 8);
+  view.setUint32(8 + data.length, crc32(new Uint8Array([...type, ...data])));
+  return out;
+}
+
+// Insert text chunks right after the 33-byte signature + IHDR header.
+function withText(png, fields) {
+  const chunks = Object.entries(fields).map(([k, v]) => textChunk(k, v));
+  const size = png.length + chunks.reduce((n, c) => n + c.length, 0);
+  const out = new Uint8Array(size);
+  out.set(png.subarray(0, 33), 0);
+  let at = 33;
+  for (const c of chunks) { out.set(c, at); at += c.length; }
+  out.set(png.subarray(33), at);
+  return out;
+}
+
+async function savePainting() {
+  const canvas = document.getElementById("paper");
+  const blob = await new Promise((r) => canvas.toBlob(r, "image/png"));
+  if (!blob) return;
+  const params = paramText(" = ").join(", ");
+  const { xmin, xmax, ymin, ymax } = S.domain;
+  const png = withText(new Uint8Array(await blob.arrayBuffer()), {
+    Title: `dx/dt = ${S.fxText};  dy/dt = ${S.fyText}`,
+    Description: [
+      params && `Parameters: ${params}`,
+      `Window: x ${xmin} to ${xmax}, y ${ymin} to ${ymax}`,
+      `Style: ${STYLES[S.style].label}`,
+      `Time t = ${S.t.toFixed(2)}`,
+    ].filter(Boolean).join(". "),
+    Software: "BrushFields",
+  });
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(new Blob([png], { type: "image/png" }));
+  a.download = pngFileName();
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 10000);
+}
+
 // ── UI wiring ─────────────────────────────────────────────────────────────────
 const $ = (id) => document.getElementById(id);
 
@@ -927,9 +1049,11 @@ function populateBrushes() {
   sel.value = S.brushName;
 }
 
+// The number boxes hold the exact values; the sliders snap to 0.01 steps,
+// which would turn a preset's c = 0.628 into 0.63.
 function readParams() {
   for (const k of ["a", "b", "c", "d"]) {
-    const v = parseFloat($(`p-${k}`).value);
+    const v = parseFloat($(`n-${k}`).value);
     S.scope[k] = Number.isFinite(v) ? v : 0;
   }
   fieldCache = null;
@@ -1116,7 +1240,7 @@ function wireUI() {
   $("clear").addEventListener("click", clearAll);
   $("redraw").addEventListener("click", redrawClean);
   const save = $("save");
-  if (save) save.addEventListener("click", () => P.saveCanvas("vector-field", "png"));
+  if (save) save.addEventListener("click", savePainting);
 
   // click to drop one particle, drag to pour a stream of them
   let dragging = false, lastDrop = null;
